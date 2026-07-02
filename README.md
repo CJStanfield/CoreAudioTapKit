@@ -12,6 +12,10 @@ system audio ──▶ CATap ──▶ ring buffer ──▶ your AudioProcessor
 **No DSP is included.** You bring the audio math (EQ, effects, metering,
 recording); CoreAudioTapKit gets the signal to you and back out cleanly.
 
+📖 **[Full documentation →](docs/README.md)** — how the capture→process→output
+pipeline works, each stage tied to Apple's Core Audio docs, plus an integration
+guide.
+
 ## Requirements
 
 - **macOS 14.2 or newer** — `AudioHardwareCreateProcessTap` doesn't exist before
