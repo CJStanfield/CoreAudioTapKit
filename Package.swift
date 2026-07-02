@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "CoreAudioTapKit",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS("14.2")],  // CATap floor: AudioHardwareCreateProcessTap
     products: [
         .library(name: "CoreAudioTapKit", targets: ["CoreAudioTapKit"]),
         .executable(name: "TapKitDemo", targets: ["TapKitDemo"]),
