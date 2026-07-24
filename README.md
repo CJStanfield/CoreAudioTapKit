@@ -30,7 +30,7 @@ guide.
 Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/<you>/CoreAudioTapKit.git", from: "0.1.0")
+.package(url: "https://github.com/CJStanfield/CoreAudioTapKit.git", from: "0.1.0")
 ```
 
 Then add the `CoreAudioTapKit` product to your target's dependencies.
