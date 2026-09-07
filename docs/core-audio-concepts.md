@@ -8,7 +8,7 @@ Everything lives in two frameworks:
   (Hardware Abstraction Layer): devices, taps, aggregate devices, the property
   system.
 - [Audio Toolbox](https://developer.apple.com/documentation/audiotoolbox) —
-  audio units, including the AUHAL output unit and its render callback.
+  aggregate devices, IOProcs, and the clock relationship between them.
 
 ---
 
@@ -24,8 +24,9 @@ Two facts about taps trip people up:
 
 1. **A tap alone gives you no readable audio.** You must attach it to an
    aggregate device (below) to actually pull samples.
-2. **A global tap captures *you* too** unless you exclude your own process — the
-   reason the kit uses the `stereoGlobalTapButExcludeProcesses` initializer.
+2. **A tap captures *you* too** unless you exclude your own process, which is
+   why the kit uses the `excludingProcesses:deviceUID:stream:` initializer and
+   scopes the tap to the output device rather than the global mix.
 
 Apple's overview article: [Capturing system audio with Core Audio taps](https://developer.apple.com/documentation/coreaudio/capturing-system-audio-with-core-audio-taps).
 
@@ -96,32 +97,35 @@ selector each time.
 
 ---
 
-## AUHAL output unit
+## Clock master and drift compensation
 
-The **AUHAL** (AudioUnit Hardware Abstraction Layer) output unit is Apple's
-standard audio unit for playing audio to a specific hardware device. You locate
-it by its subtype [`kAudioUnitSubType_HALOutput`](https://developer.apple.com/documentation/audiotoolbox/kaudiounitsubtype_haloutput)
-via [`AudioComponentFindNext`](https://developer.apple.com/documentation/audiotoolbox/audiocomponentfindnext(_:_:))
-(matched with an [`AudioComponentDescription`](https://developer.apple.com/documentation/audiotoolbox/audiocomponentdescription)),
-configure it with [`AudioUnitSetProperty`](https://developer.apple.com/documentation/audiotoolbox/audiounitsetproperty(_:_:_:_:_:_:)),
-and run it with [`AudioOutputUnitStart`](https://developer.apple.com/documentation/audiotoolbox/audiooutputunitstart(_:)).
+An aggregate device has exactly one **clock master**, the sub-device whose clock
+drives the aggregate's IO cycle. You choose it with
+[`kAudioAggregateDeviceMainSubDeviceKey`](https://developer.apple.com/documentation/coreaudio/kaudioaggregatedevicemainsubdevicekey).
+Every other member is resampled to that clock by Core Audio when
+[`kAudioSubTapDriftCompensationKey`](https://developer.apple.com/documentation/coreaudio/kaudiosubtapdriftcompensationkey)
+(for taps) or the sub-device equivalent is set, at a quality chosen by
+[`kAudioSubTapDriftCompensationQualityKey`](https://developer.apple.com/documentation/coreaudio/kaudiosubtapdriftcompensationqualitykey).
+In CoreAudioTapKit the physical output is the clock master and the tap is
+drift-compensated at maximum quality, which is what lets capture and render
+share one clock.
+
+---
+
+## IOProc on an aggregate with input and output
+
+An **IOProc** ([`AudioDeviceIOBlock`](https://developer.apple.com/documentation/coreaudio/audiodeviceioblock))
+is the block Core Audio calls on a device's realtime thread once per IO cycle.
+When the device is an aggregate that has both input members (our tap) and output
+members (the physical device), a single call delivers the input buffers and the
+output buffers together, for the same cycle, on the same clock. CoreAudioTapKit
+registers one IOProc on its aggregate and does everything inside it: normalize
+the tap's input, run your `AudioProcessor`, write the output. There is no
+separate output unit and no ring buffer between threads, because there is only
+one thread.
 
 ---
 
-## Render callback
-
-A **render callback** ([`AURenderCallback`](https://developer.apple.com/documentation/audiotoolbox/aurendercallback))
-is the function the output unit calls, on its realtime thread, whenever it needs
-another block of audio to play. You install it with
-[`kAudioUnitProperty_SetRenderCallback`](https://developer.apple.com/documentation/audiotoolbox/kaudiounitproperty_setrendercallback).
-In CoreAudioTapKit the callback drains the ring buffer, runs your
-`AudioProcessor`, and copies the result into the unit's output buffers.
-
-Because `AURenderCallback` is a plain C function pointer, the engine passes
-itself across the boundary as an opaque `Unmanaged` pointer and unwraps it inside
-the callback — a standard Core Audio Swift idiom.
-
----
 
 ## Sample rate
 

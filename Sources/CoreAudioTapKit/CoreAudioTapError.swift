@@ -1,4 +1,4 @@
-// CoreAudioTapError.swift — typed errors for the CoreAudio tap/output lifecycle.
+// CoreAudioTapError.swift — typed errors for the tap/aggregate lifecycle.
 
 import CoreAudio
 import Foundation
@@ -6,7 +6,6 @@ import Foundation
 public enum CoreAudioTapError: LocalizedError {
     case osStatus(OSStatus, String)
     case missingDeviceUID
-    case audioComponentNotFound
     case unsupportedOS
 
     public var errorDescription: String? {
@@ -15,8 +14,6 @@ public enum CoreAudioTapError: LocalizedError {
             return "\(operation) failed with OSStatus \(status)."
         case .missingDeviceUID:
             return "A valid output device is required."
-        case .audioComponentNotFound:
-            return "Could not find the HAL output audio component."
         case .unsupportedOS:
             return "Core Audio process taps require macOS 14.2 or newer."
         }

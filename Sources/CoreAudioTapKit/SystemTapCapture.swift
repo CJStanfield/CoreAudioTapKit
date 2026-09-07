@@ -1,4 +1,5 @@
-// SystemTapCapture.swift — CATap → aggregate device → ring buffer capture.
+// SystemTapCapture.swift — one aggregate, one clock: device-scoped tap + physical
+// output in a single private aggregate device, driven by a single IOProc.
 
 import AudioToolbox
 import CoreAudio
@@ -12,8 +13,30 @@ private struct TapFormatDescription {
     let isFloat: Bool
 }
 
+/// Receives the aggregate's input (the tap) and output (the physical device) in the
+/// SAME callback and must write the output buffers before returning.
+protocol UnifiedRenderTarget: AnyObject {
+    func handleUnifiedRender(
+        inputData: UnsafePointer<AudioBufferList>,
+        outputData: UnsafeMutablePointer<AudioBufferList>,
+        tapStreamCount: Int
+    )
+}
+
+/// Owns the Core Audio lifecycle: process tap → private aggregate → IOProc.
+///
+/// The design is deliberately single-clock. A device-scoped muted tap and the
+/// physical output live in ONE aggregate device whose clock master is the physical
+/// output, with maximum-quality drift compensation on the tap. One IOProc hands the
+/// tap's input buffers to the render target, which writes processed audio into the
+/// aggregate's output buffers inside the same callback.
+///
+/// There is no inter-clock ring buffer, no fill servo, and no second output client.
+/// Running the tap and the output on two clocks (a capture aggregate feeding a ring
+/// drained by a separate AUHAL unit) is what makes Bluetooth audio warble in pitch:
+/// the device-side clock estimate wobbles, and every reconciliation mechanism between
+/// two domains prints that wobble into the audio. See docs/how-it-works.md.
 nonisolated final class SystemTapCapture {
-    private let ringBuffer: StereoRingBuffer
     private let logger: Logger
 
     nonisolated(unsafe) private var tapID: AudioObjectID = AudioObjectID(kAudioObjectUnknown)
@@ -21,27 +44,45 @@ nonisolated final class SystemTapCapture {
     nonisolated(unsafe) private var aggregateIOProcID: AudioDeviceIOProcID?
     nonisolated(unsafe) private var aggregateIOBlock: AudioDeviceIOBlock?
     nonisolated(unsafe) private var tapChannelCount: Int = 2
-    nonisolated(unsafe) private var inputCallCount: UInt64 = 0
+    // How many trailing buffers of the aggregate's input ABL belong to the tap.
+    // A duplex output device (USB interface with mic/line inputs) contributes its
+    // own input streams AHEAD of the tap's; 0 = unknown, render falls back to buffer 0.
+    nonisolated(unsafe) private var tapInputStreamCount: Int = 0
     nonisolated(unsafe) private var isCapturing = false
 
-    init(ringBuffer: StereoRingBuffer, logger: Logger) {
-        self.ringBuffer = ringBuffer
+    init(logger: Logger) {
         self.logger = logger
     }
 
-    nonisolated func start(outputDeviceID: AudioObjectID, sampleRate: Double) throws {
+    /// Build the tap and the aggregate, attach the IOProc, and start the device.
+    ///
+    /// Blocking: creating the tap, creating the aggregate, waiting for it to come
+    /// alive (up to 3 s), and `AudioDeviceCreateIOProcIDWithBlock` are all mach round
+    /// trips to `coreaudiod`. Call this off the main thread. The call ORDER matters
+    /// and is the non-obvious part; see the numbered comments.
+    nonisolated func start(
+        outputDeviceID: AudioObjectID,
+        renderTarget: UnifiedRenderTarget
+    ) throws {
         guard #available(macOS 14.2, *) else {
             throw CoreAudioTapError.unsupportedOS
         }
 
         stop()
-        inputCallCount = 0
 
         let outputUID = try SystemAudioDeviceLookup.uid(for: outputDeviceID)
         let excludedProcesses = translateCurrentProcessForTapExclusion()
 
+        // 1. A DEVICE-SCOPED tap bound to the output device's stream, so the tap's
+        //    format matches that stream and there is no global-mixdown format mismatch.
+        //    Muted, so the tapped audio plays only through our output, not twice.
+        //    Our own process is excluded, or we would capture and re-emit ourselves.
         let tapUUID = UUID()
-        let tapDescription = CATapDescription(stereoGlobalTapButExcludeProcesses: excludedProcesses)
+        let tapDescription = CATapDescription(
+            excludingProcesses: excludedProcesses,
+            deviceUID: outputUID,
+            stream: 0
+        )
         tapDescription.uuid = tapUUID
         tapDescription.muteBehavior = .muted
         tapDescription.name = TapKitIdentity.tapName
@@ -51,24 +92,29 @@ nonisolated final class SystemTapCapture {
             AudioHardwareCreateProcessTap(tapDescription, &tapID),
             operation: "AudioHardwareCreateProcessTap"
         )
-
         let tapFormat = queryTapFormat(tapID)
         tapChannelCount = max(1, Int(tapFormat?.channelCount ?? 2))
 
+        // 2. ONE private aggregate containing BOTH the tap and the physical output.
+        //    The physical output is the main sub-device, which makes it the clock
+        //    master. The tap is drift-compensated at maximum quality against that
+        //    clock, inside Core Audio, on the very clock the audio plays on.
         let aggregateUID = "\(TapKitIdentity.aggregateDeviceUIDPrefix).\(UUID().uuidString)"
         let aggregateDescription: [String: Any] = [
             kAudioAggregateDeviceNameKey: TapKitIdentity.aggregateDeviceName,
             kAudioAggregateDeviceUIDKey: aggregateUID,
-            kAudioAggregateDeviceMainSubDeviceKey: outputUID,
             kAudioAggregateDeviceIsPrivateKey: true,
             kAudioAggregateDeviceIsStackedKey: false,
             kAudioAggregateDeviceTapAutoStartKey: true,
+            kAudioAggregateDeviceMainSubDeviceKey: outputUID,
             kAudioAggregateDeviceSubDeviceListKey: [
                 [kAudioSubDeviceUIDKey: outputUID]
             ],
             kAudioAggregateDeviceTapListKey: [
                 [
                     kAudioSubTapDriftCompensationKey: true,
+                    kAudioSubTapDriftCompensationQualityKey:
+                        kAudioAggregateDriftCompensationMaxQuality,
                     kAudioSubTapUIDKey: tapUUID.uuidString,
                 ]
             ],
@@ -80,12 +126,32 @@ nonisolated final class SystemTapCapture {
             operation: "AudioHardwareCreateAggregateDevice"
         )
 
+        // 3. Wait for the aggregate to report alive. Start the IOProc before this and
+        //    you get an endless stream of silent buffers with no error.
         waitForAggregateDeviceToBecomeAlive(aggregateDeviceID)
 
+        // 4. Work out which input buffers are the tap's. A duplex output device
+        //    donates its own input streams to the aggregate ahead of the tap's; on a
+        //    MOTU M4 the first input buffers are the hardware preamps, not the tapped
+        //    system audio. The tap's streams are the trailing ones.
+        let deviceInputStreams = SystemAudioDeviceLookup.inputStreamCount(for: outputDeviceID)
+        let aggregateInputStreams = SystemAudioDeviceLookup.inputStreamCount(for: aggregateDeviceID)
+        tapInputStreamCount = max(0, aggregateInputStreams - deviceInputStreams)
+        logger.info("Aggregate input streams: total=\(aggregateInputStreams) device=\(deviceInputStreams) tap=\(self.tapInputStreamCount)")
+
+        // 5. ONE IOProc. Input (tap) and output (physical device) arrive together.
+        //    The render target writes the output buffers in this same call.
         var procID: AudioDeviceIOProcID?
-        let ioBlock: AudioDeviceIOBlock = { [weak self] _, inputData, _, outputData, _ in
-            guard let self else { return }
-            self.handleTapIOProc(inputData: inputData, outputData: outputData)
+        let ioBlock: AudioDeviceIOBlock = { [weak self, weak renderTarget] _, inputData, _, outputData, _ in
+            guard let self, self.isCapturing, let renderTarget else {
+                zeroFillAudioBuffers(outputData)
+                return
+            }
+            renderTarget.handleUnifiedRender(
+                inputData: inputData,
+                outputData: outputData,
+                tapStreamCount: self.tapInputStreamCount
+            )
         }
         aggregateIOBlock = ioBlock
 
@@ -95,15 +161,26 @@ nonisolated final class SystemTapCapture {
         )
         aggregateIOProcID = procID
 
+        if let procID {
+            disableDeviceInputStreams(
+                procID: procID,
+                deviceInputStreams: deviceInputStreams,
+                tapStreams: tapInputStreamCount
+            )
+        }
+
         isCapturing = true
         try checkCoreAudioStatus(
             AudioDeviceStart(aggregateDeviceID, procID),
-            operation: "AudioDeviceStart(CATap aggregate)"
+            operation: "AudioDeviceStart(aggregate)"
         )
 
-        logStart(outputUID: outputUID, tapUUID: tapUUID, tapFormat: tapFormat, fallbackSampleRate: sampleRate)
+        logStart(outputUID: outputUID, tapUUID: tapUUID, tapFormat: tapFormat)
     }
 
+    /// Teardown order matters: flag off first, then stop → destroy IOProc → destroy
+    /// aggregate → destroy tap. `AudioDeviceStop` blocks until the device's IO thread
+    /// leaves the running state, so this too belongs off the main thread.
     nonisolated func stop() {
         isCapturing = false
 
@@ -124,67 +201,64 @@ nonisolated final class SystemTapCapture {
             tapID = AudioObjectID(kAudioObjectUnknown)
         }
         tapChannelCount = 2
+        tapInputStreamCount = 0
     }
 
-    nonisolated private func handleTapIOProc(
-        inputData: UnsafePointer<AudioBufferList>,
-        outputData: UnsafeMutablePointer<AudioBufferList>
+    /// Turn off the physical device's own input streams in our IOProc so the
+    /// aggregate stops pulling unused hardware inputs (mic/line preamps) every
+    /// cycle. The tap's streams are the trailing ones; leave only those enabled.
+    /// Best-effort: the render path's trailing-buffer indexing is the actual fix
+    /// and stays correct whether or not this takes effect.
+    nonisolated private func disableDeviceInputStreams(
+        procID: AudioDeviceIOProcID,
+        deviceInputStreams: Int,
+        tapStreams: Int
     ) {
-        inputCallCount += 1
-        guard isCapturing else { return }
+        guard deviceInputStreams > 0, tapStreams > 0 else { return }
 
-        let inputBuffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inputData))
-        guard inputBuffers.count > 0 else {
-            zeroFillAudioBuffers(outputData)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyIOProcStreamUsage,
+            mScope: kAudioObjectPropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var dataSize: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(aggregateDeviceID, &address, 0, nil, &dataSize) == noErr,
+              dataSize >= UInt32(MemoryLayout<AudioHardwareIOProcStreamUsage>.size) else {
+            logger.warning("IOProcStreamUsage size query failed; device input streams stay enabled")
             return
         }
 
-        if inputBuffers.count >= 2,
-           inputBuffers[0].mNumberChannels == 1,
-           inputBuffers[1].mNumberChannels == 1,
-           let left = inputBuffers[0].mData?.assumingMemoryBound(to: Float.self),
-           let right = inputBuffers[1].mData?.assumingMemoryBound(to: Float.self) {
-            let frameCount = min(
-                Int(inputBuffers[0].mDataByteSize),
-                Int(inputBuffers[1].mDataByteSize)
-            ) / MemoryLayout<Float>.size
-            logInputPeakIfNeeded(left: left, right: right, frameCount: frameCount)
-            ringBuffer.writeNonInterleaved(left: left, right: right, frameCount: frameCount)
-        } else if let data = inputBuffers[0].mData?.assumingMemoryBound(to: Float.self) {
-            let channelCount = max(1, Int(inputBuffers[0].mNumberChannels))
-            let frameCount = Int(inputBuffers[0].mDataByteSize) / (MemoryLayout<Float>.size * channelCount)
-            logInputPeakIfNeeded(data: data, sampleCount: frameCount * channelCount)
+        let raw = UnsafeMutableRawPointer.allocate(
+            byteCount: Int(dataSize),
+            alignment: MemoryLayout<AudioHardwareIOProcStreamUsage>.alignment
+        )
+        defer { raw.deallocate() }
+        let usage = raw.assumingMemoryBound(to: AudioHardwareIOProcStreamUsage.self)
+        usage.pointee.mIOProc = unsafeBitCast(procID, to: UnsafeMutableRawPointer.self)
 
-            if channelCount >= 2 {
-                ringBuffer.writeInterleaved(data, frameCount: frameCount, channelCount: channelCount)
-            } else {
-                ringBuffer.writeNonInterleaved(left: data, right: data, frameCount: frameCount)
-            }
+        var readSize = dataSize
+        guard AudioObjectGetPropertyData(aggregateDeviceID, &address, 0, nil, &readSize, usage) == noErr else {
+            logger.warning("IOProcStreamUsage read failed; device input streams stay enabled")
+            return
         }
 
-        zeroFillAudioBuffers(outputData)
-    }
-
-    nonisolated private func logInputPeakIfNeeded(data: UnsafePointer<Float>, sampleCount: Int) {
-        guard inputCallCount <= 10 || inputCallCount % 2000 == 0 else { return }
-        var peak: Float = 0
-        for i in 0..<sampleCount {
-            peak = max(peak, abs(data[i]))
+        let streamCount = Int(usage.pointee.mNumberStreams)
+        guard streamCount > tapStreams,
+              let flagsOffset = MemoryLayout<AudioHardwareIOProcStreamUsage>.offset(of: \.mStreamIsOn),
+              Int(readSize) >= flagsOffset + streamCount * MemoryLayout<UInt32>.size else {
+            return
         }
-        logger.info("CATap input #\(self.inputCallCount): samples=\(sampleCount) peak=\(peak) fill=\(self.ringBuffer.availableFrames)")
-    }
-
-    nonisolated private func logInputPeakIfNeeded(
-        left: UnsafePointer<Float>,
-        right: UnsafePointer<Float>,
-        frameCount: Int
-    ) {
-        guard inputCallCount <= 10 || inputCallCount % 2000 == 0 else { return }
-        var peak: Float = 0
-        for i in 0..<frameCount {
-            peak = max(peak, abs(left[i]), abs(right[i]))
+        let flags = raw.advanced(by: flagsOffset).assumingMemoryBound(to: UInt32.self)
+        for i in 0..<streamCount {
+            flags[i] = i >= streamCount - tapStreams ? 1 : 0
         }
-        logger.info("CATap input #\(self.inputCallCount): frames=\(frameCount) peak=\(peak) fill=\(self.ringBuffer.availableFrames)")
+
+        let status = AudioObjectSetPropertyData(aggregateDeviceID, &address, 0, nil, readSize, usage)
+        if status == noErr {
+            logger.info("Disabled \(streamCount - tapStreams) device input stream(s) in IOProc; tap streams stay live")
+        } else {
+            logger.warning("IOProcStreamUsage write failed (\(status)); device input streams stay enabled")
+        }
     }
 
     nonisolated private func translateCurrentProcessForTapExclusion() -> [AudioObjectID] {
@@ -231,6 +305,8 @@ nonisolated final class SystemTapCapture {
         )
     }
 
+    /// Deliberately a blocking sleep on the calling thread: an async yield here would
+    /// let a queued `stop()` interleave into a half-built aggregate.
     nonisolated private func waitForAggregateDeviceToBecomeAlive(_ deviceID: AudioObjectID) {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyDeviceIsAlive,
@@ -249,19 +325,14 @@ nonisolated final class SystemTapCapture {
         }
     }
 
-    nonisolated private func logStart(
-        outputUID: String,
-        tapUUID: UUID,
-        tapFormat: TapFormatDescription?,
-        fallbackSampleRate: Double
-    ) {
+    nonisolated private func logStart(outputUID: String, tapUUID: UUID, tapFormat: TapFormatDescription?) {
         if let tapFormat {
             logger.info(
-                "Started CATap global stereo muted | outputUID=\(outputUID, privacy: .public) tapUUID=\(tapUUID.uuidString, privacy: .public) tapID=\(self.tapID) aggregateID=\(self.aggregateDeviceID) fmt=\(tapFormat.sampleRate)Hz/\(tapFormat.channelCount)ch interleaved=\(tapFormat.isInterleaved) float=\(tapFormat.isFloat)"
+                "Started single-clock aggregate | outputUID=\(outputUID, privacy: .public) tapUUID=\(tapUUID.uuidString, privacy: .public) tapID=\(self.tapID) aggregateID=\(self.aggregateDeviceID) fmt=\(tapFormat.sampleRate)Hz/\(tapFormat.channelCount)ch interleaved=\(tapFormat.isInterleaved) float=\(tapFormat.isFloat)"
             )
         } else {
             logger.info(
-                "Started CATap global stereo muted | outputUID=\(outputUID, privacy: .public) tapUUID=\(tapUUID.uuidString, privacy: .public) tapID=\(self.tapID) aggregateID=\(self.aggregateDeviceID) fallbackSR=\(fallbackSampleRate)"
+                "Started single-clock aggregate | outputUID=\(outputUID, privacy: .public) tapUUID=\(tapUUID.uuidString, privacy: .public) tapID=\(self.tapID) aggregateID=\(self.aggregateDeviceID)"
             )
         }
     }

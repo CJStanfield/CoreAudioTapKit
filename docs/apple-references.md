@@ -10,7 +10,7 @@ stage. All links were verified live. For how these fit together, see
 - [Core Audio](https://developer.apple.com/documentation/coreaudio) — HAL,
   taps, aggregate devices, property system
 - [Audio Toolbox](https://developer.apple.com/documentation/audiotoolbox) —
-  audio units (AUHAL) and the render callback
+  the clock and drift-compensation keys
 
 ## Background reading
 
@@ -24,7 +24,7 @@ stage. All links were verified live. For how these fit together, see
 ## Stage 1 — Process tap
 
 - [`CATapDescription`](https://developer.apple.com/documentation/coreaudio/catapdescription)
-- [`init(stereoGlobalTapButExcludeProcesses:)`](https://developer.apple.com/documentation/coreaudio/catapdescription/init(stereoglobaltapbutexcludeprocesses:))
+- [`init(excludingProcesses:deviceUID:stream:)`](https://developer.apple.com/documentation/coreaudio/catapdescription/init(excludingprocesses:deviceuid:stream:))
 - [`muteBehavior`](https://developer.apple.com/documentation/coreaudio/catapdescription/mutebehavior)
 - [`CATapMuteBehavior`](https://developer.apple.com/documentation/coreaudio/catapmutebehavior)
 - [`AudioHardwareCreateProcessTap`](https://developer.apple.com/documentation/coreaudio/audiohardwarecreateprocesstap(_:_:))
@@ -38,25 +38,21 @@ stage. All links were verified live. For how these fit together, see
 - [`kAudioAggregateDeviceTapListKey`](https://developer.apple.com/documentation/coreaudio/kaudioaggregatedevicetaplistkey)
 - [`kAudioSubTapUIDKey`](https://developer.apple.com/documentation/coreaudio/kaudiosubtapuidkey)
 - [`kAudioAggregateDeviceTapAutoStartKey`](https://developer.apple.com/documentation/coreaudio/kaudioaggregatedevicetapautostartkey)
+- [`kAudioAggregateDeviceMainSubDeviceKey`](https://developer.apple.com/documentation/coreaudio/kaudioaggregatedevicemainsubdevicekey) (clock master)
+- [`kAudioSubTapDriftCompensationKey`](https://developer.apple.com/documentation/coreaudio/kaudiosubtapdriftcompensationkey)
+- [`kAudioSubTapDriftCompensationQualityKey`](https://developer.apple.com/documentation/coreaudio/kaudiosubtapdriftcompensationqualitykey)
+- [`kAudioAggregateDriftCompensationMaxQuality`](https://developer.apple.com/documentation/coreaudio/kaudioaggregatedriftcompensationmaxquality)
 
-## Stage 3 — Capture IOProc
+## Stage 3 — The one IOProc (capture, process, render)
 
 - [`AudioDeviceCreateIOProcIDWithBlock`](https://developer.apple.com/documentation/coreaudio/audiodevicecreateioprocidwithblock(_:_:_:_:))
 - [`AudioDeviceStart`](https://developer.apple.com/documentation/coreaudio/audiodevicestart(_:_:))
 - [`AudioDeviceStop`](https://developer.apple.com/documentation/coreaudio/audiodevicestop(_:_:))
+- [`AudioDeviceIOBlock`](https://developer.apple.com/documentation/coreaudio/audiodeviceioblock)
+- [`kAudioDevicePropertyStreams`](https://developer.apple.com/documentation/coreaudio/kaudiodevicepropertystreams)
+- [`kAudioDevicePropertyIOProcStreamUsage`](https://developer.apple.com/documentation/coreaudio/kaudiodevicepropertyioprocstreamusage)
 
 ## Cross-cutting — Property system
 
 - [`AudioObjectGetPropertyData`](https://developer.apple.com/documentation/coreaudio/audioobjectgetpropertydata(_:_:_:_:_:_:))
 - [`AudioObjectPropertyAddress`](https://developer.apple.com/documentation/coreaudio/audioobjectpropertyaddress)
-
-## Stage 6 — AUHAL output
-
-- [`AudioComponentFindNext`](https://developer.apple.com/documentation/audiotoolbox/audiocomponentfindnext(_:_:))
-- [`AudioComponentDescription`](https://developer.apple.com/documentation/audiotoolbox/audiocomponentdescription)
-- [`kAudioUnitSubType_HALOutput`](https://developer.apple.com/documentation/audiotoolbox/kaudiounitsubtype_haloutput)
-- [`AudioUnitSetProperty`](https://developer.apple.com/documentation/audiotoolbox/audiounitsetproperty(_:_:_:_:_:_:))
-- [`kAudioUnitProperty_SetRenderCallback`](https://developer.apple.com/documentation/audiotoolbox/kaudiounitproperty_setrendercallback)
-- [`AURenderCallback`](https://developer.apple.com/documentation/audiotoolbox/aurendercallback)
-- [`AudioOutputUnitStart`](https://developer.apple.com/documentation/audiotoolbox/audiooutputunitstart(_:))
-- [`AudioOutputUnitStop`](https://developer.apple.com/documentation/audiotoolbox/audiooutputunitstop(_:))
