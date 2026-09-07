@@ -99,11 +99,13 @@ try engine.start(outputUID: current!.uid)
 engine.stop()
 ```
 
-`start` resolves the device, reads its sample rate, calls your `prepare`, brings
-up capture, pre-fills ~50 ms, then starts output — see
-[How It Works](how-it-works.md) for the full sequence. `stop` tears the whole
-chain down and is safe to call repeatedly. `deinit` calls `stop` for you, but
-call it explicitly when you're done to release the tap promptly.
+`start` resolves the device, reads its sample rate, calls your `prepare`, builds
+the tap and the single aggregate, waits for it to come alive, and starts the one
+IOProc; see [How It Works](how-it-works.md) for the full sequence. It blocks for
+up to a few seconds while `coreaudiod` does that work, so call it off the main
+thread. `stop` tears the whole chain down, also blocking, and is safe to call
+repeatedly. `deinit` calls `stop` for you, but call it explicitly when you are
+done to release the tap promptly.
 
 ## The realtime rules
 
@@ -135,7 +137,6 @@ func process(_ s: UnsafeMutablePointer<Float>, frameCount n: Int, channelCount c
 | --- | --- |
 | `.unsupportedOS` | Running on macOS < 14.2 — process taps don't exist. |
 | `.missingDeviceUID` | Empty/invalid output UID passed to `start`. |
-| `.audioComponentNotFound` | The AUHAL output component wasn't found (should not happen on a healthy system). |
 | `.osStatus(status, operation)` | A specific Core Audio call failed; `operation` names which, `status` is the `OSStatus`. |
 
 ## Try the demo

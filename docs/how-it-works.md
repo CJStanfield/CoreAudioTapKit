@@ -1,15 +1,18 @@
 # How It Works
 
-CoreAudioTapKit moves audio through six stages. This page walks each one in the
-order it happens at runtime, points at the exact Core Audio call that does the
-work, and links to Apple's documentation for it. Code references are to the
-files in `Sources/CoreAudioTapKit/`.
+CoreAudioTapKit moves audio through four stages, and the last one is the whole
+point: capture and output happen in one callback on one clock. This page walks
+each stage in the order it happens at runtime, points at the exact Core Audio
+call that does the work, and links to Apple's documentation for it. Code
+references are to the files in `Sources/CoreAudioTapKit/`.
 
 ```
- ┌─────────────┐   ┌──────────────────┐   ┌──────────────┐   ┌─────────────┐   ┌──────────────┐
- │ 1. Process  │──▶│ 2. Aggregate     │──▶│ 3. Capture   │──▶│ 4. Ring     │──▶│ 5. Your      │──▶ 6. AUHAL
- │    tap      │   │    device (alive)│   │    IOProc    │   │    buffer   │   │  AudioProcessor│    output
- └─────────────┘   └──────────────────┘   └──────────────┘   └─────────────┘   └──────────────┘
+ ┌──────────────────────┐   ┌────────────────────────────────────┐   ┌───────────────────────────────┐
+ │ 1. Device-scoped     │──▶│ 2. ONE private aggregate:          │──▶│ 3. ONE IOProc: tap input in,  │
+ │    process tap       │   │    tap + physical output,          │   │    your AudioProcessor,       │
+ │    (muted, excludes  │   │    output is clock master,         │   │    written to the aggregate's │
+ │    our process)      │   │    tap drift-compensated (alive?)  │   │    output buffers, same call  │
+ └──────────────────────┘   └────────────────────────────────────┘   └───────────────────────────────┘
 ```
 
 ---
@@ -19,20 +22,22 @@ files in `Sources/CoreAudioTapKit/`.
 **File:** `SystemTapCapture.start(outputDeviceID:sampleRate:)`
 
 A *process tap* is a macOS 14.2 object that receives a copy of audio flowing
-through the system. We build a tap that captures the **global** mix but
-**excludes our own process** (otherwise we would capture the very audio we are
-about to play, and feed back on ourselves), and we mute the original tapped
-stream so it plays only through our output, not twice.
+through the system. We build a tap **scoped to the chosen output device's
+stream**, so the tap's format matches that stream exactly and there is no
+global-mixdown format mismatch to reconcile later. It **excludes our own
+process** (otherwise we would capture the very audio we are about to play, and
+feed back on ourselves), and it is **muted**, so the tapped audio plays only
+through our output, not twice.
 
 ```swift
-let tapDescription = CATapDescription(stereoGlobalTapButExcludeProcesses: excludedProcesses)
+let tapDescription = CATapDescription(excludingProcesses: excludedProcesses, deviceUID: outputUID, stream: 0)
 tapDescription.muteBehavior = .muted
 var tapID = AudioObjectID(kAudioObjectUnknown)
 AudioHardwareCreateProcessTap(tapDescription, &tapID)
 ```
 
 - The description object: [`CATapDescription`](https://developer.apple.com/documentation/coreaudio/catapdescription)
-- The "global, but exclude these PIDs" initializer: [`init(stereoGlobalTapButExcludeProcesses:)`](https://developer.apple.com/documentation/coreaudio/catapdescription/init(stereoglobaltapbutexcludeprocesses:))
+- The device-scoped "exclude these PIDs" initializer: [`init(excludingProcesses:deviceUID:stream:)`](https://developer.apple.com/documentation/coreaudio/catapdescription/init(excludingprocesses:deviceuid:stream:))
 - Muting the tapped source so it isn't heard twice: [`muteBehavior`](https://developer.apple.com/documentation/coreaudio/catapdescription/mutebehavior) / [`CATapMuteBehavior`](https://developer.apple.com/documentation/coreaudio/catapmutebehavior)
 - Creating the tap: [`AudioHardwareCreateProcessTap`](https://developer.apple.com/documentation/coreaudio/audiohardwarecreateprocesstap(_:_:))
 
@@ -56,8 +61,11 @@ AudioObjectGetPropertyData(/* system object */, &address, …, &pid, …, &proce
 
 A tap by itself produces nothing you can read. You make its audio available by
 composing an **aggregate device** whose sub-device is your chosen output and
-whose *tap list* contains the tap. We build it **private** (not visible in Sound
-preferences) and set it to auto-start the tap.
+whose *tap list* contains the tap. This is also where the single clock is
+decided: the physical output is the aggregate's **main sub-device**, which makes
+it the clock master, and the tap is **drift-compensated at maximum quality**
+against that clock. We build the aggregate **private** (not visible in Sound
+settings) and set it to auto-start the tap.
 
 ```swift
 let aggregateDescription: [String: Any] = [
@@ -99,118 +107,113 @@ for _ in 0..<30 {
 
 ---
 
-## Stage 3 — Run the capture IOProc
+## Stage 3 — One IOProc: capture, process, and render in the same call
 
-**File:** `SystemTapCapture` → `handleTapIOProc`
+**File:** `SystemTapCapture.start` registers the block; `SystemAudioTapEngine.handleUnifiedRender` is the body
 
-An **IOProc** is a block Core Audio calls repeatedly on a realtime thread, each
-time handing you a slice of captured audio. We register one on the aggregate
-device and start it.
+An **IOProc** is a block Core Audio calls repeatedly on a realtime thread. On an
+aggregate that contains both an input (our tap) and an output (the physical
+device), one IOProc invocation delivers the tap's input buffers **and** the
+device's output buffers together. We register one IOProc on the aggregate, and
+in every call we normalize the tap's input to interleaved stereo scratch, hand
+that to your `AudioProcessor`, and write the result into the output buffers
+before returning.
 
 ```swift
-AudioDeviceCreateIOProcIDWithBlock(&procID, aggregateDeviceID, nil) { _, inputData, _, _, _ in
-    self.handleTapIOProc(inputData: inputData, outputData: outputData)   // copy into ring buffer
+AudioDeviceCreateIOProcIDWithBlock(&procID, aggregateDeviceID, nil) { _, inputData, _, outputData, _ in
+    renderTarget.handleUnifiedRender(inputData: inputData, outputData: outputData, tapStreamCount: tapStreams)
 }
 AudioDeviceStart(aggregateDeviceID, procID)
 ```
 
 - Registering the block: [`AudioDeviceCreateIOProcIDWithBlock`](https://developer.apple.com/documentation/coreaudio/audiodevicecreateioprocidwithblock(_:_:_:_:))
-- Starting/stopping capture: [`AudioDeviceStart`](https://developer.apple.com/documentation/coreaudio/audiodevicestart(_:_:)) / [`AudioDeviceStop`](https://developer.apple.com/documentation/coreaudio/audiodevicestop(_:_:))
+- Starting/stopping: [`AudioDeviceStart`](https://developer.apple.com/documentation/coreaudio/audiodevicestart(_:_:)) / [`AudioDeviceStop`](https://developer.apple.com/documentation/coreaudio/audiodevicestop(_:_:))
+- The block signature (input and output ABLs in one call): [`AudioDeviceIOBlock`](https://developer.apple.com/documentation/coreaudio/audiodeviceioblock)
 
-Inside the IOProc we read the tap's buffers (the tap may deliver two mono
-channels or one interleaved buffer — the kit handles both) and write the frames
-into the ring buffer. That's the hand-off from the capture thread to the output
-thread.
+There is no ring buffer, no second thread, and no second output client. The tap's
+frames go to your processor and out to the device in the same callback, on the
+device's clock.
 
----
+### Which input buffers are the tap's
 
-## Stage 4 — Buffer between two realtime threads
+A plain output device contributes no input streams, so the tap's buffers start at
+index 0. A **duplex** interface (a USB interface with mic or line inputs) donates
+its own input streams to the aggregate **ahead of** the tap's, so on a MOTU M4
+the first input buffers are the hardware preamps, not the system audio. The kit
+counts the tap's streams as the difference between the aggregate's input streams
+and the device's own, treats the tap's buffers as the **trailing** ones, and
+turns the device's unused hardware streams off in its IOProc so they are not
+pulled every cycle.
 
-**File:** `StereoRingBuffer`
-
-Capture (Stage 3) and output (Stage 6) run on **different realtime threads** at
-different, unsynchronized rates. A ring buffer decouples them: the IOProc writes,
-the render callback reads. A single `os_unfair_lock` guards both channels so a
-read can never see left/right desynchronized. When the reader outpaces the
-writer, reads zero-fill rather than block.
-
-The engine pre-fills ~50 ms of audio into this buffer **before** starting output,
-which gives a stable latency floor and prevents the initial silence you'd
-otherwise hear while the buffer warms up.
+- Stream counts: [`kAudioDevicePropertyStreams`](https://developer.apple.com/documentation/coreaudio/kaudiodevicepropertystreams)
+- Per-IOProc stream enablement: [`kAudioDevicePropertyIOProcStreamUsage`](https://developer.apple.com/documentation/coreaudio/kaudiodevicepropertyioprocstreamusage) / [`AudioHardwareIOProcStreamUsage`](https://developer.apple.com/documentation/coreaudio/audiohardwareioprocstreamusage)
 
 ### The property system underneath everything
 
-Stages 1–3 all talk to Core Audio through one uniform mechanism: you describe
+Stages 1 to 3 all talk to Core Audio through one uniform mechanism: you describe
 *what* you want with an [`AudioObjectPropertyAddress`](https://developer.apple.com/documentation/coreaudio/audioobjectpropertyaddress)
 (a selector + scope + element) and read or write it with
 [`AudioObjectGetPropertyData`](https://developer.apple.com/documentation/coreaudio/audioobjectgetpropertydata(_:_:_:_:_:_:)).
-Device lists, device UIDs, sample rates, the `IsAlive` flag, the PID→object
-translation — every one is a property read. See
+Device lists, device UIDs, sample rates, the `IsAlive` flag, the PID to object
+translation, stream counts: every one is a property read. See
 [Core Audio Concepts](core-audio-concepts.md#the-property-system) for a fuller
 explanation.
 
 ---
 
-## Stage 5 — Your AudioProcessor
+## Stage 4 — Your AudioProcessor
 
-**File:** `SystemAudioTapEngine.handleOutputRender` calls
+**File:** `SystemAudioTapEngine.handleUnifiedRender` calls
 `processor.process(_:frameCount:channelCount:)`
 
-This is your hook. For every block the output unit renders, the engine drains
-that many frames from the ring buffer into a scratch buffer and hands it to your
-[`AudioProcessor`](using-coreaudiotapkit.md) to mutate in place — interleaved
-`L R L R …`, `channelCount == 2`. Whatever you write is what gets played. This is
-the entire "modify" surface of the library; the kit ships no DSP of its own.
+This is your hook. For every IOProc call, the engine hands you the tap's frames
+for that cycle as interleaved `L R L R …` with `channelCount == 2`, to mutate in
+place. Whatever you write is what gets played, in that same cycle. This is the
+entire "modify" surface of the library; the kit ships no DSP of its own.
 
 Your `prepare(sampleRate:)` was called earlier, off the realtime thread, with
-the output device's actual sample rate — that's where sample-rate-dependent
+the output device's actual sample rate; that is where sample-rate-dependent
 setup belongs. See [Using CoreAudioTapKit](using-coreaudiotapkit.md#the-realtime-rules)
 for the realtime rules `process` must obey.
 
 ---
 
-## Stage 6 — Render to the output device (AUHAL)
+## Why one clock
 
-**File:** `HALOutputEngine`
+The first public version of this kit did what most examples do: a tap-only
+aggregate captured into a ring buffer, and a separate AUHAL output unit drained
+the ring and played it. On built-in speakers that is fine. On Bluetooth it
+warbles in pitch, about ±0.5 to 1% on a two-second period, worst for 44.1 kHz
+sources on a 48 kHz-presented device, plus a several-percent glide at every
+playback start while the earbuds' playout servo re-centers.
 
-The final stage is an **AUHAL output unit** — the standard audio unit for
-sending audio to a hardware output device. We find the component, point it at the
-chosen device, set its input stream format to match the source sample rate,
-install a render callback, and start it.
+The cause is that the two ends were on **independent clocks**. A Bluetooth
+device's clock estimate wobbles short-term by a percent or more, and every
+mechanism that reconciles the two domains (Core Audio's own sample rate
+conversion on the tap, ring fill rails, a PI-controlled varispeed servo)
+prints that wobble into the audio. Bigger buffers, more lookahead, lighter
+callbacks, tuned servos, keep-alive dither, and pinning the device rate were all
+tried and all falsified by experiment. A minimal repro with zero application
+code reproduced the warble whenever two clocks existed.
 
-```swift
-var desc = AudioComponentDescription(
-    componentType: kAudioUnitType_Output,
-    componentSubType: kAudioUnitSubType_HALOutput,      // the AUHAL
-    componentManufacturer: kAudioUnitManufacturer_Apple, …)
-let component = AudioComponentFindNext(nil, &desc)
-// … AudioComponentInstanceNew, set CurrentDevice, set StreamFormat …
-AudioUnitSetProperty(audioUnit, kAudioUnitProperty_SetRenderCallback, …, &cb, …)
-AudioOutputUnitStart(audioUnit)
-```
-
-- Finding the unit: [`AudioComponentFindNext`](https://developer.apple.com/documentation/audiotoolbox/audiocomponentfindnext(_:_:)) with [`AudioComponentDescription`](https://developer.apple.com/documentation/audiotoolbox/audiocomponentdescription)
-- The AUHAL subtype: [`kAudioUnitSubType_HALOutput`](https://developer.apple.com/documentation/audiotoolbox/kaudiounitsubtype_haloutput)
-- Installing the callback: [`AudioUnitSetProperty`](https://developer.apple.com/documentation/audiotoolbox/audiounitsetproperty(_:_:_:_:_:_:)) + [`kAudioUnitProperty_SetRenderCallback`](https://developer.apple.com/documentation/audiotoolbox/kaudiounitproperty_setrendercallback)
-- The callback type: [`AURenderCallback`](https://developer.apple.com/documentation/audiotoolbox/aurendercallback)
-- Start/stop: [`AudioOutputUnitStart`](https://developer.apple.com/documentation/audiotoolbox/audiooutputunitstart(_:)) / [`AudioOutputUnitStop`](https://developer.apple.com/documentation/audiotoolbox/audiooutputunitstop(_:))
-
-The render callback is a C function pointer, so the engine passes itself across
-the boundary as an opaque pointer (`Unmanaged.passUnretained`) and unwraps it
-inside the callback to reach `handleOutputRender` — Stage 5.
+With the tap and the physical output in one aggregate clocked by the output,
+Core Audio does its drift compensation inside its own machinery against the
+clock the audio actually plays on, and there is nothing left to reconcile. That
+is the whole design, and it is why this kit will not grow a ring buffer again.
 
 ---
 
 ## Teardown
 
-`stop()` reverses everything in order: stop and dispose the output unit, stop the
-capture IOProc, destroy the aggregate device
+`stop()` reverses everything in order: clear the capturing flag, stop and
+destroy the IOProc, destroy the aggregate device
 ([`AudioHardwareDestroyAggregateDevice`](https://developer.apple.com/documentation/coreaudio/audiohardwaredestroyaggregatedevice(_:))),
 and destroy the tap
 ([`AudioHardwareDestroyProcessTap`](https://developer.apple.com/documentation/coreaudio/audiohardwaredestroyprocesstap(_:))).
 Leaving a private aggregate device or tap alive across restarts leaks system
-audio objects, so teardown always runs — including from `deinit` and at the top
-of `start()`.
+audio objects, so teardown always runs, including from `deinit` and at the top
+of `start()`. `AudioDeviceStop` blocks until the device's IO thread has left the
+running state, so call `stop()` off the main thread too.
 
 ---
 

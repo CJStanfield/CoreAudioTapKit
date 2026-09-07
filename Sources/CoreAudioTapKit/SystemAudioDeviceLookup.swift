@@ -53,6 +53,21 @@ nonisolated enum SystemAudioDeviceLookup {
         return AudioObjectGetPropertyData(deviceID, &address, 0, nil, &dataSize, &sampleRate) == noErr ? sampleRate : 0
     }
 
+    /// Number of input-scope streams a device publishes (0 on failure or for
+    /// output-only devices). Each stream contributes one buffer to an IOProc ABL.
+    static func inputStreamCount(for deviceID: AudioObjectID) -> Int {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreams,
+            mScope: kAudioObjectPropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var dataSize: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &dataSize) == noErr else {
+            return 0
+        }
+        return Int(dataSize) / MemoryLayout<AudioStreamID>.size
+    }
+
     static func uid(for deviceID: AudioObjectID) throws -> String {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyDeviceUID,

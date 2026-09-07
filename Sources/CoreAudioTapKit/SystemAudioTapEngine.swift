@@ -1,4 +1,4 @@
-// SystemAudioTapEngine.swift — capture → user processor → output, the app-facing façade.
+// SystemAudioTapEngine.swift — the app-facing façade and the render target.
 
 import AudioToolbox
 import CoreAudio
@@ -7,33 +7,32 @@ import os.log
 
 private let logger = Logger(subsystem: tapKitLogSubsystem, category: "TapEngine")
 
-/// Captures all system audio, runs it through a user `AudioProcessor`, and
-/// plays the result out on a chosen device.
+/// Captures all system audio bound for one output device, runs it through your
+/// `AudioProcessor`, and writes the result back to that device, all inside a single
+/// Core Audio IOProc on a single clock.
 ///
-/// The CoreAudio lifecycles live in `SystemTapCapture` and `HALOutputEngine`.
-/// This type is the public façade and the AUHAL render-callback target.
+/// The Core Audio lifecycle lives in `SystemTapCapture`. This type is the public
+/// façade and the IOProc render target: it normalizes the tap's input buffers to
+/// interleaved stereo scratch, calls the processor, and writes the output buffers.
 public final class SystemAudioTapEngine {
     private static let scratchBufferFrameCapacity = 16_384
 
     private let processor: AudioProcessor
-    private let ringBuffer: StereoRingBuffer
     private let tapCapture: SystemTapCapture
-    private let outputEngine: HALOutputEngine
 
     nonisolated(unsafe) public private(set) var isRunning = false
-    nonisolated(unsafe) private var outputSampleRate: Double = 48_000
+    /// The output device's nominal sample rate for the current run.
+    nonisolated(unsafe) public private(set) var sampleRate: Double = 48_000
 
-    // Pre-allocated scratch buffer for the realtime render callback.
+    // Pre-allocated scratch for the realtime callback. Sized generously up front so
+    // the IOProc never touches the heap.
     nonisolated(unsafe) private let scratchBuffer = UnsafeMutablePointer<Float>.allocate(
         capacity: SystemAudioTapEngine.scratchBufferFrameCapacity * 2
     )
 
     public init(processor: AudioProcessor) {
         self.processor = processor
-        let ring = StereoRingBuffer(capacityFrames: 9600)
-        ringBuffer = ring
-        tapCapture = SystemTapCapture(ringBuffer: ring, logger: logger)
-        outputEngine = HALOutputEngine(logger: logger)
+        tapCapture = SystemTapCapture(logger: logger)
     }
 
     public convenience init(_ process: @escaping (UnsafeMutablePointer<Float>, Int, Int) -> Void) {
@@ -41,37 +40,31 @@ public final class SystemAudioTapEngine {
     }
 
     deinit {
-        stop()
+        // The IOProc writes into `scratchBuffer`; destroy it before freeing the buffer.
+        tapCapture.stop()
         scratchBuffer.deallocate()
     }
 
+    /// Start capturing and rendering on the device with this UID.
+    ///
+    /// Blocking for up to a few seconds (tap and aggregate creation are mach round
+    /// trips; the aggregate is polled until alive). Call it off the main thread.
+    /// `prepare(sampleRate:)` is called on your processor before any audio flows.
     public func start(outputUID: String) throws {
         guard !outputUID.isEmpty else { throw CoreAudioTapError.missingDeviceUID }
 
         stop()
-        ringBuffer.reset()
 
         do {
             let outputID = try SystemAudioDeviceLookup.resolveDeviceID(uid: outputUID)
-            let reportedSR = SystemAudioDeviceLookup.sampleRate(for: outputID)
-            let sampleRate = reportedSR > 0 ? reportedSR : 48_000
-            outputSampleRate = sampleRate
+            let reported = SystemAudioDeviceLookup.sampleRate(for: outputID)
+            sampleRate = reported > 0 ? reported : 48_000
 
             processor.prepare(sampleRate: sampleRate)
-            logger.info("Output device \(outputID) sample rate: \(sampleRate)")
+            logger.info("Output device \(outputID) sample rate: \(self.sampleRate)")
 
             isRunning = true
-
-            // Stage 1: CATap captures the system mix into the ring buffer.
-            try tapCapture.start(outputDeviceID: outputID, sampleRate: sampleRate)
-
-            // Pre-fill: let the tap fill the ring before starting output.
-            // Provides stable ~50 ms latency and prevents initial silence.
-            Thread.sleep(forTimeInterval: 0.05)
-
-            // Stage 2: AUHAL output on the physical device drains the ring and
-            // runs the user processor in the render callback.
-            try outputEngine.start(deviceID: outputID, sourceSampleRate: sampleRate, renderTarget: self)
+            try tapCapture.start(outputDeviceID: outputID, renderTarget: self)
         } catch {
             logger.error("Start failed: \(error.localizedDescription)")
             stop()
@@ -79,50 +72,43 @@ public final class SystemAudioTapEngine {
         }
     }
 
+    /// Stop and tear down the tap, the aggregate, and the IOProc. Blocking; the
+    /// device's IO thread must leave the running state first.
     public func stop() {
-        outputEngine.stop()
         tapCapture.stop()
         isRunning = false
-        ringBuffer.reset()
     }
+}
 
-    /// AUHAL render callback target. Drains the ring, runs the processor in
-    /// place, writes to the output buffers.
-    nonisolated func handleOutputRender(
-        inNumberFrames: UInt32,
-        ioData: UnsafeMutablePointer<AudioBufferList>
-    ) -> OSStatus {
-        let frameCount = Int(inNumberFrames)
-        guard frameCount <= Self.scratchBufferFrameCapacity else {
-            logger.error("Render requested \(frameCount) frames, exceeding scratch capacity")
-            zeroFillAudioBuffers(ioData)
-            return noErr
-        }
-
-        let buffers = UnsafeMutableAudioBufferListPointer(ioData)
-        let temp = scratchBuffer
-
-        ringBuffer.readInterleaved(temp, frameCount: frameCount)
-        processor.process(temp, frameCount: frameCount, channelCount: 2)
-        writeRenderOutput(from: temp, frameCount: frameCount, to: buffers)
-        return noErr
-    }
-
-    private func writeRenderOutput(
-        from samples: UnsafePointer<Float>,
-        frameCount: Int,
-        to buffers: UnsafeMutableAudioBufferListPointer
+extension SystemAudioTapEngine: UnifiedRenderTarget {
+    /// Single-clock render: the tap's input and the physical output arrive in the SAME
+    /// IOProc invocation. Normalize input to stereo scratch, run the processor, write
+    /// straight to the output buffers. No ring, no clock bridging.
+    ///
+    /// `tapStreamCount` is how many TRAILING input buffers belong to the tap. A duplex
+    /// interface's own hardware inputs come first in the ABL, and reading them instead
+    /// of the tap renders preamp noise floor as "audio".
+    nonisolated func handleUnifiedRender(
+        inputData: UnsafePointer<AudioBufferList>,
+        outputData: UnsafeMutablePointer<AudioBufferList>,
+        tapStreamCount: Int
     ) {
-        if buffers.count == 1 && buffers[0].mNumberChannels >= 2 {
-            guard let data = buffers[0].mData?.assumingMemoryBound(to: Float.self) else { return }
-            memcpy(data, samples, frameCount * 2 * MemoryLayout<Float>.size)
-        } else if buffers.count >= 2 {
-            if let left = buffers[0].mData?.assumingMemoryBound(to: Float.self) {
-                for i in 0..<frameCount { left[i] = samples[i * 2] }
-            }
-            if let right = buffers[1].mData?.assumingMemoryBound(to: Float.self) {
-                for i in 0..<frameCount { right[i] = samples[i * 2 + 1] }
-            }
-        }
+        zeroFillAudioBuffers(outputData)
+
+        let outputBuffers = UnsafeMutableAudioBufferListPointer(outputData)
+        let outputCapacity = writableFrameCapacity(outputBuffers)
+        guard outputCapacity > 0 else { return }
+
+        let inputBufferCount = Int(inputData.pointee.mNumberBuffers)
+        let tapStart = tapBufferStartIndex(bufferCount: inputBufferCount, tapStreamCount: tapStreamCount)
+
+        let frameLimit = min(outputCapacity, Self.scratchBufferFrameCapacity)
+        let frameCount = normalizeToInterleavedStereo(
+            inputData, into: scratchBuffer, maxFrames: frameLimit, startingAtBuffer: tapStart
+        )
+        guard frameCount > 0 else { return }
+
+        processor.process(scratchBuffer, frameCount: frameCount, channelCount: 2)
+        writeInterleavedStereo(scratchBuffer, frameCount: frameCount, to: outputBuffers)
     }
 }
